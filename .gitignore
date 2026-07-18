@@ -37,5 +37,7 @@ Thumbs.db
 *.pyc
 __pycache__/
 
-# ===== 已迁移至 tools/ 的开发脚本 =====
-scripts/
+# ===== 开发脚本与环境引导(进版本控制,clone 即用)=====
+# .envrc: direnv 自动激活 ESP-IDF(无密钥,纯激活逻辑)
+# scripts/: bootstrap.sh / select-board.sh 等环境管理脚本
+# 这两项默认不忽略(前面没有匹配规则),会正常进版本控制

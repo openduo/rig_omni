@@ -1,0 +1,13 @@
+# rig_omni 构建脚本依赖
+#
+# 这些包需要装进 ESP-IDF 的 Python venv(~/.espressif/python_env/idfX.Y_pyZ.W_env),
+# 因为 idf.py 在编译时会用 venv 的 python 执行 tools/spiffs_assets/ 下的打包脚本。
+#
+# 安装方式(已激活 IDF 环境后):
+#   pip install -r requirements.txt
+# 或 bootstrap.sh 会自动处理。
+
+# SPIFFS 资源打包(tools/spiffs_assets/spiffs_assets_gen.py)需要
+numpy>=1.24
+Pillow>=10.0          # PIL,图片处理(EAF 表情/资源打包)
+packaging>=23.0       # 版本号比较
