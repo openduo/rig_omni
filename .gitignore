@@ -41,3 +41,14 @@ __pycache__/
 # .envrc: direnv 自动激活 ESP-IDF(无密钥,纯激活逻辑)
 # scripts/: bootstrap.sh / select-board.sh 等环境管理脚本
 # 这两项默认不忽略(前面没有匹配规则),会正常进版本控制
+
+# ===== Tailscale PoC =====
+poc/build/
+poc/sdkconfig
+poc/sdkconfig.old
+poc/managed_components/
+poc/dependencies.lock
+# 凭证文件绝不入库(模板 secrets.env.example 可入库)
+poc/secrets.env
+tailscale-env
+.tailscale-env
