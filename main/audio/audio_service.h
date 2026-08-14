@@ -5,6 +5,7 @@
 #include <deque>
 #include <condition_variable>
 #include <chrono>
+#include <atomic>
 #include <mutex>
 
 #include <freertos/FreeRTOS.h>
@@ -81,6 +82,12 @@ struct AudioServiceCallbacks {
     std::function<void(const std::string&)> on_wake_word_detected;
     std::function<void(bool)> on_vad_change;
     std::function<void(void)> on_audio_testing_queue_full;
+    // [ambient-mod] Pre-AFE PCM, same tap as CONFIG_USE_AUDIO_DEBUGGER.
+    // Debug only — no NS / AGC / AEC.
+    std::function<void(const std::vector<int16_t>&)> on_raw_audio;
+    // [ambient-mod] Post-AFE frames. This is the ambient uplink. Not
+    // VAD-gated: AudioProcessorTask calls output_callback_ every frame.
+    std::function<void(const std::vector<int16_t>&)> on_processed_audio;
 };
 
 
@@ -116,6 +123,9 @@ public:
     const std::string& GetLastWakeWord() const;
     bool IsVoiceDetected() const { return voice_detected_; }
     bool IsIdle();
+
+    /* Decode queue, play queue, or I2S DMA still draining. */
+    bool IsSpeakerActive();
     void WaitForPlaybackQueueEmpty();
     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
@@ -129,6 +139,7 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    void PlayPcm(std::vector<int16_t>&& pcm, int sample_rate);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
@@ -145,6 +156,20 @@ private:
     void* opus_decoder_ = nullptr;
     std::mutex decoder_mutex_;
     std::mutex input_resampler_mutex_;
+    /* PlayPcm and OpusCodecTask share output_resampler_. Upstream
+     * locked only the input converter. SetDecodeSampleRate close+reopen
+     * races process() without this. */
+    std::mutex output_resampler_mutex_;
+    /* rate_cvt max-out ignores leftover state. Variable-length feeds
+     * overrun; feed constant decoder_frame_size_ blocks. */
+    std::vector<int16_t> output_resample_carry_;
+    uint32_t dbg_frames_ = 0;
+    uint32_t dbg_blocks_ = 0;
+    uint32_t dbg_dropped_ = 0;
+    std::atomic<uint32_t> dbg_qempty_after_write_{0};
+    /* ResetDecoder clears this: inter-utterance silence is not a hole. */
+    int64_t dbg_last_write_end_us_ = 0;
+    uint32_t dbg_prev_block_us_ = 0;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
     

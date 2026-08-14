@@ -72,6 +72,8 @@ void AudioService::Initialize(AudioCodec* codec) {
         decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
         decoder_frame_size_ = decoder_sample_rate_ / 1000 * OPUS_FRAME_DURATION_MS;
     }
+    /* Vendor encoder unused; decoder stays for PlaySound / downlink. */
+#if 0
     esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
     ret = esp_opus_enc_open(&opus_enc_cfg, sizeof(esp_opus_enc_config_t), &opus_encoder_);
     if (opus_encoder_ == nullptr) {
@@ -82,6 +84,7 @@ void AudioService::Initialize(AudioCodec* codec) {
         esp_opus_enc_get_frame_size(opus_encoder_, &encoder_frame_size_, &encoder_outbuf_size_);
         encoder_frame_size_ = encoder_frame_size_ / sizeof(int16_t);
     }
+#endif
 
     if (codec->input_sample_rate() != 16000) {
         esp_ae_rate_cvt_cfg_t input_resampler_cfg = RATE_CVT_CFG(
@@ -99,7 +102,9 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        if (callbacks_.on_processed_audio) {
+            callbacks_.on_processed_audio(data);
+        }
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -190,12 +195,12 @@ void AudioService::Start() {
         opus_codec_stack_ = (StackType_t*)heap_caps_malloc(opus_codec_stack_size, MALLOC_CAP_SPIRAM);
     }
 
-    /* Start the opus codec task with PSRAM stack */
+    /* Decode at 7 (was 2). At 2, a 60 ms packet took 446 ms behind AFE. */
     opus_codec_task_handle_ = xTaskCreateStatic([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
-    }, "opus_codec", opus_codec_stack_size / sizeof(StackType_t), this, 2,
+    }, "opus_codec", opus_codec_stack_size / sizeof(StackType_t), this, 7,
        opus_codec_stack_, &opus_codec_tcb_);
 }
 
@@ -256,6 +261,10 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     }
     audio_debugger_->Feed(data);
 #endif
+
+    if (callbacks_.on_raw_audio) {
+        callbacks_.on_raw_audio(data);
+    }
 
     return true;
 }
@@ -339,7 +348,43 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
+        static uint32_t dbg_wn = 0, dbg_hole_n = 0, dbg_hole_us_max = 0, dbg_audio_ms_sum = 0;
+        static int64_t dbg_wlast_print_us = 0;
+        const int64_t dbg_w0 = esp_timer_get_time();
+        if (dbg_last_write_end_us_ != 0 && dbg_prev_block_us_ != 0) {
+            const uint32_t gap = (uint32_t)(dbg_w0 - dbg_last_write_end_us_);
+            if (gap > dbg_prev_block_us_) {
+                dbg_hole_n += 1;
+                const uint32_t hole = gap - dbg_prev_block_us_;
+                if (hole > dbg_hole_us_max) dbg_hole_us_max = hole;
+            }
+        }
+
         codec_->OutputData(task->pcm);
+
+        {
+            const int64_t w1 = esp_timer_get_time();
+            const uint32_t block_us =
+                (uint32_t)((int64_t)task->pcm.size() * 1000000 / codec_->output_sample_rate());
+            dbg_last_write_end_us_ = w1;
+            dbg_prev_block_us_ = block_us;
+            dbg_wn += 1;
+            dbg_audio_ms_sum += block_us / 1000;
+            if (w1 - dbg_wlast_print_us >= 1000000) {
+                ESP_LOGW(TAG, "[play-out] n=%u audio_ms=%u holes=%u hole_max_us=%u qempty_total=%u",
+                         dbg_wn, dbg_audio_ms_sum, dbg_hole_n, dbg_hole_us_max,
+                         (unsigned)dbg_qempty_after_write_);
+                dbg_wn = 0; dbg_audio_ms_sum = 0; dbg_hole_n = 0; dbg_hole_us_max = 0;
+                dbg_wlast_print_us = w1;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> qlock(audio_queue_mutex_);
+            if (audio_playback_queue_.empty()) {
+                ++dbg_qempty_after_write_;
+            }
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -369,6 +414,17 @@ void AudioService::OpusCodecTask() {
 
         /* Decode the audio from decode queue */
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+            static int64_t dbg_last_decode_end_us = 0;
+            static uint32_t dbg_n = 0, dbg_decode_us_sum = 0, dbg_decode_us_max = 0, dbg_gap_us_max = 0;
+            static int64_t dbg_last_print_us = 0;
+            const size_t dbg_dq = audio_decode_queue_.size();
+            const size_t dbg_pq = audio_playback_queue_.size();
+            const int64_t dbg_t0 = esp_timer_get_time();
+            if (dbg_last_decode_end_us != 0) {
+                uint32_t gap = (uint32_t)(dbg_t0 - dbg_last_decode_end_us);
+                if (gap > dbg_gap_us_max) dbg_gap_us_max = gap;
+            }
+
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
             audio_queue_cv_.notify_all();
@@ -398,6 +454,7 @@ void AudioService::OpusCodecTask() {
                 decoder_lock.unlock();
                 if (ret == ESP_AUDIO_ERR_OK) {
                     task->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
+                    std::lock_guard<std::mutex> rs_lock(output_resampler_mutex_);
                     if (decoder_sample_rate_ != codec_->output_sample_rate() && output_resampler_ != nullptr) {
                         uint32_t target_size = 0;
                         esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task->pcm.size(), &target_size);
@@ -421,6 +478,22 @@ void AudioService::OpusCodecTask() {
                 lock.lock();
             }
             debug_statistics_.decode_count++;
+
+            {
+                const int64_t t1 = esp_timer_get_time();
+                dbg_last_decode_end_us = t1;
+                const uint32_t decode_us = (uint32_t)(t1 - dbg_t0);
+                dbg_n += 1;
+                dbg_decode_us_sum += decode_us;
+                if (decode_us > dbg_decode_us_max) dbg_decode_us_max = decode_us;
+                if (t1 - dbg_last_print_us >= 1000000) {
+                    ESP_LOGW(TAG, "[play] n=%u dec_avg_us=%u dec_max_us=%u gap_max_us=%u dq=%u pq=%u",
+                             dbg_n, dbg_n ? dbg_decode_us_sum / dbg_n : 0, dbg_decode_us_max,
+                             dbg_gap_us_max, (unsigned)dbg_dq, (unsigned)dbg_pq);
+                    dbg_n = 0; dbg_decode_us_sum = 0; dbg_decode_us_max = 0; dbg_gap_us_max = 0;
+                    dbg_last_print_us = t1;
+                }
+            }
         }
         /* Encode the audio to send queue */
         if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
@@ -476,6 +549,80 @@ void AudioService::OpusCodecTask() {
     ESP_LOGW(TAG, "Opus codec task stopped");
 }
 
+void AudioService::PlayPcm(std::vector<int16_t>&& pcm, int sample_rate) {
+    if (pcm.empty()) return;
+    if (codec_ == nullptr) return;
+
+    SetDecodeSampleRate(sample_rate, decoder_duration_ms_);
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->timestamp = 0;
+
+    {
+        std::lock_guard<std::mutex> rs_lock(output_resampler_mutex_);
+        if (sample_rate != codec_->output_sample_rate() && output_resampler_ != nullptr) {
+            const size_t block = decoder_frame_size_ > 0 ? (size_t)decoder_frame_size_ : pcm.size();
+            output_resample_carry_.insert(output_resample_carry_.end(), pcm.begin(), pcm.end());
+
+            std::vector<int16_t> merged;
+            size_t off = 0;
+            while (output_resample_carry_.size() - off >= block) {
+                uint32_t target = 0;
+                esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, block, &target);
+                std::vector<int16_t> out(target);
+                uint32_t actual = target;
+                esp_ae_rate_cvt_process(output_resampler_,
+                                        (esp_ae_sample_t)(output_resample_carry_.data() + off), block,
+                                        (esp_ae_sample_t)out.data(), &actual);
+                /* 夹一道：库报过 actual 是容量的 2.1 倍。**这挡不住它已经写出去的越界**，
+                 * 只是防止我们跟着按那个数去读 `out` —— 那会是第二个越界。 */
+                if (actual > target) {
+                    ESP_LOGE(TAG, "[rs] library overran: in=%u target=%u actual=%u",
+                             (unsigned)block, (unsigned)target, (unsigned)actual);
+                    actual = target;
+                }
+                merged.insert(merged.end(), out.begin(), out.begin() + actual);
+                off += block;
+                ++dbg_blocks_;
+            }
+            output_resample_carry_.erase(output_resample_carry_.begin(),
+                                         output_resample_carry_.begin() + off);
+            if (merged.empty()) {
+                return;  /* 还不够一块，攒着 —— 这次没有可播的东西 */
+            }
+            /* 各块的输出拼成**一个**任务：播放队列上限只有 8 个，
+             * 一块一个任务会把队列挤爆并丢音。 */
+            task->pcm = std::move(merged);
+        } else {
+            task->pcm = std::move(pcm);
+        }
+    }
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    /* 队列满就丢这一块 —— 绝不阻塞 WS 接收任务（阻塞它=连接被判死）。 */
+    ++dbg_frames_;
+    const size_t qdepth = audio_playback_queue_.size();
+    if (qdepth >= MAX_PLAYBACK_TASKS_IN_QUEUE * 4) {
+        ++dbg_dropped_;
+        ESP_LOGW(TAG, "[snd] frame#%u DROPPED q=%u/%u | blocks=%u carry=%u drops=%u starve=%u",
+                 (unsigned)dbg_frames_, (unsigned)qdepth,
+                 (unsigned)(MAX_PLAYBACK_TASKS_IN_QUEUE * 4), (unsigned)dbg_blocks_,
+                 (unsigned)output_resample_carry_.size(), (unsigned)dbg_dropped_,
+                 (unsigned)dbg_qempty_after_write_.load());
+        return;
+    }
+    audio_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    /* [诊断] 结巴归因的四个数，每帧一行。q= 是**入队前**的深度：
+     * 逼近上限 ⇒ 供大于求（丢）；长期为 0 ⇒ 供不上（饿）。 */
+    ESP_LOGW(TAG, "[snd] frame#%u ok q=%u/%u | blocks=%u carry=%u drops=%u starve=%u",
+             (unsigned)dbg_frames_, (unsigned)qdepth,
+             (unsigned)(MAX_PLAYBACK_TASKS_IN_QUEUE * 4), (unsigned)dbg_blocks_,
+             (unsigned)output_resample_carry_.size(), (unsigned)dbg_dropped_,
+             (unsigned)dbg_qempty_after_write_.load());
+}
+
 void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
     if (decoder_sample_rate_ == sample_rate && decoder_duration_ms_ == frame_duration) {
         return;
@@ -497,6 +644,8 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
     decoder_frame_size_ = decoder_sample_rate_ / 1000 * frame_duration;
 
     auto codec = Board::GetInstance().GetAudioCodec();
+    std::lock_guard<std::mutex> rs_lock(output_resampler_mutex_);
+    output_resample_carry_.clear();
     if (decoder_sample_rate_ != codec->output_sample_rate()) {
         ESP_LOGI(TAG, "Resampling audio from %d to %d", decoder_sample_rate_, codec->output_sample_rate());
         if (output_resampler_ != nullptr) {
@@ -689,6 +838,24 @@ bool AudioService::IsIdle() {
     return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
 }
 
+bool AudioService::IsSpeakerActive() {
+    /* 尾巴长度**不是拍的**：`i2s_channel_write` 返回时数据只是交给了 DMA，
+     * 还没播出去。DMA 里最多压着
+     *   AUDIO_CODEC_DMA_DESC_NUM(6) × AUDIO_CODEC_DMA_FRAME_NUM(240) = 1440 帧
+     * 在 16 kHz 下正好 **90 毫秒**。这段时间喇叭还在响，麦克风也还在听见它。 */
+    const int64_t rate = codec_ != nullptr ? codec_->output_sample_rate() : 16000;
+    const int64_t kDmaTailMs =
+        (int64_t)AUDIO_CODEC_DMA_DESC_NUM * AUDIO_CODEC_DMA_FRAME_NUM * 1000 / rate;
+
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (!audio_decode_queue_.empty() || !audio_playback_queue_.empty()) {
+        return true;
+    }
+    auto since_output = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - last_output_time_).count();
+    return since_output < kDmaTailMs;
+}
+
 void AudioService::WaitForPlaybackQueueEmpty() {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
     audio_queue_cv_.wait(lock, [this]() { 
@@ -707,6 +874,10 @@ void AudioService::ResetDecoder() {
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
+    /* Stream boundary: the next write starts a new stream, so the gap across it
+     * is silence between answers, not a DMA hole. */
+    dbg_last_write_end_us_ = 0;
+    dbg_prev_block_us_ = 0;
     audio_queue_cv_.notify_all();
 }
 
@@ -727,6 +898,14 @@ void AudioService::CheckAndUpdateAudioPowerState() {
 
 void AudioService::SetModelsList(srmodel_list_t* models_list) {
     models_list_ = models_list;
+
+    /* [ambient-mod] No wake-word engine. Always-open mic; nothing consumes
+     * wake events. The engine is a second esp-sr AFE, and input_reference()
+     * upgrades it to dual-channel AEC — a working set this design does not
+     * spend. To bring wake words back, delete this early-out and re-audit
+     * the internal-RAM budget. */
+    wake_word_ = nullptr;
+    return;
 
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
     if (esp_srmodel_filter(models_list_, ESP_MN_PREFIX, NULL) != nullptr) {

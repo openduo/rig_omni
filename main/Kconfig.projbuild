@@ -182,6 +182,14 @@ config USE_SERVER_AEC
     help
         To work perperly, server-side AEC requires server support
 
+# [ambient-mod] Upstream #ifdefs this; the stock Kconfig never defined it.
+config USE_DEVICE_AEC
+    bool "Enable Device-Side AEC (loopback reference channel)"
+    default n
+    depends on USE_AUDIO_PROCESSOR
+    help
+        Hover: I2S din==dout loopback, AFE format "MR".
+
 config USE_AUDIO_DEBUGGER
     bool "Enable Audio Debugger"
     default n

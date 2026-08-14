@@ -362,7 +362,7 @@ public:
         InitializeTools();
         
         InitializeCamera();
-        
+
         InitializeUart();
         InitializeController();
 

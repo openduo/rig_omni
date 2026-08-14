@@ -13,6 +13,7 @@
 #include <time.h>
 
 // ESP-IDF headers
+#include <esp_err.h>
 #include <esp_log.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_timer.h>
@@ -59,12 +60,46 @@ static bool OnFlushIoReady(const esp_lcd_panel_io_handle_t panel_io,
     return true;
 }
 
+/* After a draw failure, skip draw attempts for this long and complete flushes
+ * immediately. Un-wedging the renderer (below) revealed that the failure is not a
+ * connect-window blip: once internal heap sits below the SPI transaction threshold,
+ * EVERY frame fails, and 30 attempts/s each cost an SPI-queue call plus three
+ * synchronous UART log lines from the panel drivers — measured ~90 log lines/s,
+ * competing with the audio tasks. One probe per second bounds the recovery latency
+ * at 1 s once heap frees while cutting the failure work by 30x. */
+static constexpr int64_t kDrawBackoffUs = 1000000;
+static int64_t s_draw_blocked_until_us = 0;
+
 // Flush callback for emote
 static void OnFlushCallback(int x_start, int y_start, int x_end, int y_end, const void* data, emote_handle_t handle)
 {
+    /* Failed SPI never sets WAIT_FLUSH_DONE; the renderer holds the
+     * lock forever unless we complete the handshake here. */
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)emote_get_user_data(handle);
-    if (panel != nullptr) {
-        esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
+    if (panel == nullptr) {
+        emote_notify_flush_finished(handle);
+        return;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us < s_draw_blocked_until_us) {
+        emote_notify_flush_finished(handle);
+        return;
+    }
+    const esp_err_t err = esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
+    if (err != ESP_OK) {
+        /* Log only the streak start, not every probe — the panel drivers already
+         * emit two error lines per failed attempt. */
+        if (s_draw_blocked_until_us == 0) {
+            ESP_LOGW(TAG, "draw_bitmap failed (%s) — completing flushes, probing 1/s until it recovers",
+                     esp_err_to_name(err));
+        }
+        s_draw_blocked_until_us = now_us + kDrawBackoffUs;
+        emote_notify_flush_finished(handle);
+        return;
+    }
+    if (s_draw_blocked_until_us != 0) {
+        s_draw_blocked_until_us = 0;
+        ESP_LOGW(TAG, "draw_bitmap recovered — resuming full-rate rendering");
     }
 }
 

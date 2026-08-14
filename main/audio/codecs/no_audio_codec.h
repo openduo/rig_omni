@@ -11,6 +11,8 @@ class NoAudioCodec : public AudioCodec {
 protected:
     std::mutex data_if_mutex_;
 
+    /* AEC ref is I2S loopback (din == dout). A software ring jittered
+     * 960–2400 samples and never converged. */
     virtual int Write(const int16_t* data, int samples) override;
     virtual int Read(int16_t* dest, int samples) override;
     virtual void EnableInput(bool enable) override;
@@ -18,6 +20,13 @@ protected:
 
 public:
     virtual ~NoAudioCodec();
+
+protected:
+    i2s_chan_handle_t ref_rx_handle_ = nullptr;
+    /* Do not stop TX after first enable: gating the clock randomizes
+     * the mic/ref offset and AEC cannot cancel. */
+    bool spk_clock_on_ = false;
+    void EnsureSpkClock();
 };
 
 class NoAudioCodecDuplex : public NoAudioCodec {

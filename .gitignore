@@ -48,6 +48,16 @@ poc/sdkconfig
 poc/sdkconfig.old
 poc/managed_components/
 poc/dependencies.lock
+# cmake 在 poc/ 里就地 configure 留下的产物(不是 build/ 下,所以上面那条盖不住)
+poc/CMakeCache.txt
+poc/CMakeFiles/
+poc/build.ninja
+poc/cmake_install.cmake
+poc/config/
+poc/config.env
+poc/kconfigs.in
+poc/kconfigs_projbuild.in
+poc/components_with_manifests_list.temp.overrides
 # 凭证文件绝不入库(模板 secrets.env.example 可入库)
 poc/secrets.env
 tailscale-env

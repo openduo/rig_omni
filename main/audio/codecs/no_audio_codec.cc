@@ -1,6 +1,8 @@
 #include "no_audio_codec.h"
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <vector>
 #include <cmath>
 #include <cstring>
 
@@ -9,6 +11,9 @@
 NoAudioCodec::~NoAudioCodec() {
     if (rx_handle_ != nullptr) {
         ESP_ERROR_CHECK(i2s_channel_disable(rx_handle_));
+    }
+    if (ref_rx_handle_ != nullptr) {
+        ESP_ERROR_CHECK(i2s_channel_disable(ref_rx_handle_));
     }
     if (tx_handle_ != nullptr) {
         ESP_ERROR_CHECK(i2s_channel_disable(tx_handle_));
@@ -79,6 +84,9 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     duplex_ = false;
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
+    /* Hover uses this overload. Skip it and AFE stays "M" with AEC off. */
+    input_reference_ = (input_sample_rate == output_sample_rate);
+    input_channels_ = input_reference_ ? 2 : 1;
 
     // Create a new channel for speaker
     i2s_chan_config_t chan_cfg = {
@@ -90,7 +98,7 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
         .auto_clear_before_cb = false,
         .intr_priority = 0,
     };
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, nullptr));
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, &ref_rx_handle_));
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = {
@@ -131,6 +139,15 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
         }
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
+    /* Loopback RX matches TX because a shared clock is a hard full-duplex constraint.
+     * Only `din` differs and points to the same pin as `dout`. When TX is idle, the line is
+     * silent and a zero reference is naturally correct. */
+    {
+        i2s_std_config_t ref_cfg = std_cfg;
+        ref_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
+        ref_cfg.gpio_cfg.din = spk_dout;
+        ESP_ERROR_CHECK(i2s_channel_init_std_mode(ref_rx_handle_, &ref_cfg));
+    }
 
     // Create a new channel for MIC
     chan_cfg.id = (i2s_port_t)1;
@@ -148,6 +165,8 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     duplex_ = false;
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
+    input_reference_ = (input_sample_rate == output_sample_rate);
+    input_channels_ = input_reference_ ? 2 : 1;
 
     // Create a new channel for speaker
     i2s_chan_config_t chan_cfg = {
@@ -159,7 +178,7 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
         .auto_clear_before_cb = false,
         .intr_priority = 0,
     };
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, nullptr));
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, &ref_rx_handle_));
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = {
@@ -200,6 +219,13 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
         }
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
+    /* Loopback RX matches TX, with `din` pointing to the same pin as `dout` per ESP-IDF internal-loopback semantics. */
+    {
+        i2s_std_config_t ref_cfg = std_cfg;
+        ref_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
+        ref_cfg.gpio_cfg.din = spk_dout;
+        ESP_ERROR_CHECK(i2s_channel_init_std_mode(ref_rx_handle_, &ref_cfg));
+    }
 
     // Create a new channel for MIC
     chan_cfg.id = (i2s_port_t)1;
@@ -213,6 +239,7 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
     ESP_LOGI(TAG, "Simplex channels created");
 }
+
 
 int NoAudioCodec::Write(const int16_t* data, int samples) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
@@ -232,6 +259,8 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
         }
     }
 
+    /* Do not capture the AEC reference here. Hardware-loopback RX reads the amplifier-line
+     * bytes directly in `Read()`, naturally including volume scaling. See the header comment. */
     size_t bytes_written;
     ESP_ERROR_CHECK(i2s_channel_write(tx_handle_, buffer.data(), samples * sizeof(int32_t), &bytes_written, portMAX_DELAY));
     return bytes_written / sizeof(int32_t);
@@ -240,18 +269,89 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
 int NoAudioCodec::Read(int16_t* dest, int samples) {
     size_t bytes_read;
 
-    std::vector<int32_t> bit32_buffer(samples);
-    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) {
+    /* samples is interleaved [mic, ref] when ch==2. */
+    const int ch = input_channels_;
+    const int frames = (ch == 2) ? samples / 2 : samples;
+
+    std::vector<int32_t> bit32_buffer(frames);
+    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), frames * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) {
         ESP_LOGE(TAG, "Read Failed!");
         return 0;
     }
 
     samples = bytes_read / sizeof(int32_t);
+    int clipped = 0;
+    int32_t peak_raw = 0;  // 移位**前**的峰值绝对值 —— 钳位吃不到它
     for (int i = 0; i < samples; i++) {
-        int32_t value = bit32_buffer[i] >> 12;
-        dest[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
+        /* High 16 of left-aligned 24-bit. >>12 / >>14 clip; AEC cannot
+         * cancel clipped samples. Do not change shift mid-playback. */
+        int32_t value = bit32_buffer[i] >> 16;
+        const int32_t a = bit32_buffer[i] < 0 ? -bit32_buffer[i] : bit32_buffer[i];
+        if (a > peak_raw) peak_raw = a;
+        if (value > INT16_MAX || value < -INT16_MAX) clipped++;
+        const int16_t mic = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
+        dest[(ch == 2) ? (i * 2) : i] = mic;
     }
-    return samples;
+    if (ch == 2) {
+        std::vector<int16_t> ref(samples, 0);
+        if (ref_rx_handle_ != nullptr && spk_clock_on_) {
+            std::vector<int32_t> ref32(samples);
+            size_t ref_bytes = 0;
+            /* The timeout leaves more than a frame of margin. Equal rates and DMA depths
+             * should make data continuously ready. A timeout means loopback is not running,
+             * such as when the TX controller is disabled, so zero-fill and count it. */
+            if (i2s_channel_read(ref_rx_handle_, ref32.data(), samples * sizeof(int32_t),
+                                 &ref_bytes, pdMS_TO_TICKS(100)) == ESP_OK) {
+                const int got = (int)(ref_bytes / sizeof(int32_t));
+                for (int i = 0; i < got && i < samples; i++) {
+                    const int32_t v = ref32[i] >> 16;
+                    ref[i] = (v > INT16_MAX) ? INT16_MAX : (v < -INT16_MAX) ? -INT16_MAX : (int16_t)v;
+                }
+            } else {
+                static unsigned short_reads = 0;
+                if ((++short_reads % 50) == 1) {
+                    ESP_LOGW(TAG, "[aec] ref loopback read timeout ×%u — feeding zeros", short_reads);
+                }
+            }
+        }
+        for (int i = 0; i < samples; i++) {
+            dest[i * 2 + 1] = ref[i];
+        }
+        static unsigned dbg = 0;
+        if ((dbg++ % 200) == 0) {
+            double ms = 0, rs = 0;
+            int16_t mmin = INT16_MAX, mmax = INT16_MIN, rmin = INT16_MAX, rmax = INT16_MIN;
+            for (int i = 0; i < samples; i++) {
+                const int16_t m = dest[i * 2], r = dest[i * 2 + 1];
+                ms += (double)m * m; rs += (double)r * r;
+                if (m < mmin) { mmin = m; }
+                if (m > mmax) { mmax = m; }
+                if (r < rmin) { rmin = r; }
+                if (r > rmax) { rmax = r; }
+            }
+            ESP_LOGW(TAG, "[aec] mic_rms=%.0f [%d,%d]  ref_rms=%.0f [%d,%d]  src=hw-loop",
+                     sqrt(ms / samples), mmin, mmax,
+                     sqrt(rs / samples), rmin, rmax);
+        }
+    }
+
+    if (clipped > 0) {
+        static unsigned n = 0;
+        if ((n++ % 20) == 0) {
+            ESP_LOGW(TAG, "[gain] clipped=%d/%d peak_raw=%ld (>>12 => %ld, 满量程 %d) "
+                          "需再右移 %d 位才不削顶",
+                     clipped, samples, (long)peak_raw, (long)(peak_raw >> 12), INT16_MAX,
+                     (int)ceil(log2((double)(peak_raw >> 12) / (double)INT16_MAX)));
+        }
+    }
+    return (ch == 2) ? samples * 2 : samples;
+}
+
+/* Enable TX once and keep it running. See `spk_clock_on_` in the header for the rationale. Idempotent. */
+void NoAudioCodec::EnsureSpkClock() {
+    if (spk_clock_on_) return;
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
+    spk_clock_on_ = true;
 }
 
 void NoAudioCodec::EnableInput(bool enable) {
@@ -260,9 +360,17 @@ void NoAudioCodec::EnableInput(bool enable) {
         return;
     }
     if (enable) {
+        if (ref_rx_handle_ != nullptr) {
+            /* Start the clock before both RX channels so mic and ref lock step here, establishing the constant offset. */
+            EnsureSpkClock();
+            ESP_ERROR_CHECK(i2s_channel_enable(ref_rx_handle_));
+        }
         ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
     } else {
         ESP_ERROR_CHECK(i2s_channel_disable(rx_handle_));
+        if (ref_rx_handle_ != nullptr) {
+            ESP_ERROR_CHECK(i2s_channel_disable(ref_rx_handle_));
+        }
     }
     AudioCodec::EnableInput(enable);
 }
@@ -273,9 +381,11 @@ void NoAudioCodec::EnableOutput(bool enable) {
         return;
     }
     if (enable) {
-        ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
-    } else {
+        EnsureSpkClock();
+    } else if (ref_rx_handle_ == nullptr) {
+        /* Stop TX only without loopback. With loopback, keep the clock running and update only the logical output state. */
         ESP_ERROR_CHECK(i2s_channel_disable(tx_handle_));
+        spk_clock_on_ = false;
     }
     AudioCodec::EnableOutput(enable);
 }

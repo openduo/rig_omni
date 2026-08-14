@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "ambient_ws.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -119,6 +120,9 @@ void Application::Initialize() {
     };
     callbacks.on_vad_change = [this](bool speaking) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+    };
+    callbacks.on_processed_audio = [](const std::vector<int16_t>& pcm) {
+        ambient::FeedPcm(pcm);
     };
     audio_service_.SetCallbacks(callbacks);
 
@@ -325,7 +329,9 @@ void Application::HandleNetworkDisconnectedEvent() {
     auto state = GetDeviceState();
     if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
-        protocol_->CloseAudioChannel();
+        if (protocol_) {
+            protocol_->CloseAudioChannel();
+        }
     }
 
     // Update the status bar immediately to show the network state
@@ -352,10 +358,17 @@ void Application::HandleActivationDoneEvent() {
     board.SetPowerSaveLevel(GetUserPowerSaveLevel());
     board.OnInitializationComplete();  // 通知板级初始化完成
 
-    Schedule([this]() {
-        // Play the success sound to indicate the device is ready
-        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
-    });
+    /* After StartNetwork. Earlier, gethostbyname asserts Invalid mbox.
+     * EnableVoiceProcessing first: AFE is the uplink tap, and
+     * ResetDecoder must run before any boot sound. */
+    if (auto* c = Board::GetInstance().GetAudioCodec()) {
+        c->SetOutputVolume(100);
+        ESP_LOGW("Application", "[ambient] output volume forced to 100");
+    }
+    audio_service_.EnableVoiceProcessing(true);
+    /* aec_init only allocates; enable_aec() is EnableDeviceAec. */
+    audio_service_.EnableDeviceAec(true);
+    ambient::StartWsUplink();
 }
 
 void Application::ActivationTask() {
@@ -368,8 +381,8 @@ void Application::ActivationTask() {
     // Check for new firmware version
     CheckNewVersion();
 
-    // Initialize the protocol
-    InitializeProtocol();
+    /* Vendor cloud is a second brain. Activation events still fire. */
+    // InitializeProtocol();
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
@@ -875,8 +888,8 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
-            audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            /* Stay on Idle: vendor protocol is off, uplink still needs AFE. */
+            audio_service_.EnableVoiceProcessing(true);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -939,7 +952,8 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateActivating:
             // 启动/激活状态，显示连接中
             display->SetStatus(Lang::Strings::CONNECTING);
-            display->SetEmotion("connecting");
+            /* hover has no "connecting" asset. */
+            display->SetEmotion("scanning");
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(false);
             break;

@@ -79,7 +79,7 @@ poc/
 │   ├── CMakeLists.txt
 │   └── poc_main.cc             # WiFi→tailnet→Qwen 三阶段验证
 ├── third_party/
-│   └── microlink/              # git submodule,pin v2.1.0
+│   └── microlink/              # git submodule → antmanler/microlink @ duoduo-edge (v2.1.0 + field fixes)
 └── secrets.env.example         # 凭证模板(真实文件在 ~/.tailscale-env)
 ```
 
@@ -88,7 +88,7 @@ poc/
 - **DERP region 硬编码 9 (Dallas)**:国内访问延迟可能较高,但验证连通性够用
 - **无 ICMP ping**:microlink 不提供原始 ICMP,只能用 DISCO ping(PC 侧)/ TCP 连接验证
 - **内存占用**:microlink ~1MB PSRAM 峰值 + 116KB SRAM。PoC 已把 H2/JSON buffer 降到 128KB,与主工程音频栈共存时仍需监控 OOM
-- **稳定性 bug**:microlink #17/#20 (wireguardif pbuf double-free) 未合并,PoC 短时验证无影响,长跑可能崩
+- **stability**: upstream #17/#20 (wireguardif pbuf double-free) is still unmerged upstream; our fork branch carries the fix
 
 ## 下一步(PoC 成功后)
 

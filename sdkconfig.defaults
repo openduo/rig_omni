@@ -82,3 +82,23 @@ CONFIG_LV_BUILD_DEMOS=n
 
 # Do not send wake word audio data to server
 CONFIG_SEND_WAKE_WORD_DATA=n
+
+# [ambient-mod] mbedtls primitives microlink links against. Missing any
+# of the four is a link error (undefined mbedtls_chachapoly_*). Must live
+# here, not in sdkconfig — that file is gitignored and a fresh clone
+# would not see it.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_HKDF_C=y
+
+# [ambient-mod] Device-side AEC (loopback reference channel). Mutually exclusive
+# with USE_SERVER_AEC (application.cc #error guard) — a fresh clone with both set
+# fails to compile. The live device runs DEVICE_AEC only; server AEC was the
+# interim mode before the reference channel landed and is retired.
+CONFIG_USE_DEVICE_AEC=y
+
+# [ambient-mod] No port-80 config web server on the device: NVS settings still
+# load at init (the init/start split in ml_config_httpd.c), this only drops the
+# httpd task (~7-8 KB internal RAM). Re-provisioning needs a build with it on.
+CONFIG_ML_CONFIG_HTTPD=n

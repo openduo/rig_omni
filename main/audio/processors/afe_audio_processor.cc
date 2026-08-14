@@ -37,6 +37,8 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
     char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     
+    /* [ambient-mod] Device AEC: VC + VOIP high-perf. VAD/ASR live on the
+     * server; the device only has to cancel what it is playing. */
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
     afe_config->vad_mode = VAD_MODE_2;  // 提高 VAD 灵敏度
@@ -45,13 +47,11 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->vad_model_name = vad_model_name;
     }
 
-    if (ns_model_name != nullptr) {
-        afe_config->ns_init = true;
-        afe_config->ns_model_name = ns_model_name;
-        afe_config->afe_ns_mode = AFE_NS_MODE_NET;
-    } else {
-        afe_config->ns_init = false;
-    }
+    /* [ambient-mod] Neural-net NS is off. It is the expensive AFE stage and
+     * starves the feed path while the server already denoises for ASR.
+     * Do not re-enable for "quality". */
+    afe_config->ns_init = false;
+    (void)ns_model_name;
 
     afe_config->agc_init = true;  // 启用自动增益控制，提高麦克风灵敏度
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
@@ -66,7 +66,17 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
-    
+
+    /* [ambient-mod] Print the config the AFE actually took. enable_aec()
+     * return values are dropped upstream, so this is the only reading. */
+    ESP_LOGW(TAG, "[aec-init] type=%d mode=%d aec_mode=%d aec_init=%d ns_init=%d vad_init=%d agc_init=%d agc_mode=%d agc_compression_gain_db=%d agc_target_level_dbfs=%d linear_gain=%.2f",
+             (int)afe_config->afe_type, (int)afe_config->afe_mode, (int)afe_config->aec_mode,
+             (int)afe_config->aec_init, (int)afe_config->ns_init, (int)afe_config->vad_init,
+             (int)afe_config->agc_init, (int)afe_config->agc_mode,
+             (int)afe_config->agc_compression_gain_db, (int)afe_config->agc_target_level_dbfs,
+             afe_config->afe_linear_gain);
+
+
     /* Allocate task stack in PSRAM */
     const size_t stack_size = 4096;
     if (task_stack_ == nullptr) {
@@ -200,13 +210,15 @@ void AfeAudioProcessor::EnableDeviceAec(bool enable) {
     if (enable) {
 #if CONFIG_USE_DEVICE_AEC
         afe_iface_->disable_vad(afe_data_);
-        afe_iface_->enable_aec(afe_data_);
+        int ret = afe_iface_->enable_aec(afe_data_);
+        ESP_LOGW(TAG, "[aec-init] enable_aec ret=%d", ret);
 #else
         ESP_LOGE(TAG, "Device AEC is not supported");
 #endif
     } else {
 #if CONFIG_USE_DEVICE_AEC
-        afe_iface_->disable_aec(afe_data_);
+        int ret = afe_iface_->disable_aec(afe_data_);
+        ESP_LOGW(TAG, "[aec-init] disable_aec ret=%d", ret);
 #endif
         afe_iface_->enable_vad(afe_data_);
     }
